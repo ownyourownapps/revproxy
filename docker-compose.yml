@@ -1,0 +1,134 @@
+networks:
+  traefik:
+    external: true
+
+services:
+  # Based on https://doc.traefik.io/traefik/setup/docker/
+  traefik:
+    image: traefik:v3.6.2
+    container_name: traefik
+    command:
+      # EntryPoints
+      - --entrypoints.web.address=:80
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      - --entrypoints.websecure.address=:443
+      - --entryPoints.websecure.http.tls=true
+      # this is needed for cloudflare to work
+      - --entryPoints.websecure.forwardedHeaders.trustedIPs=0.0.0.0/0
+      - --entryPoints.web.forwardedHeaders.trustedIPs=0.0.0.0/0
+      # Dedicated metrics entry point
+      - --entrypoints.metrics.address=:8082
+
+      # Providers
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=traefik
+
+      # API & Dashboard       
+      - --api.dashboard=true
+      - --api.insecure=false
+
+      # Observability 
+      - --log.level=INFO
+      - --accesslog=true
+
+      # Metrics
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entrypoint=metrics
+      - --metrics.prometheus.addrouterslabels=true
+      - --metrics.prometheus.addserviceslabels=true
+
+      # TLS Certificate Management (Let's Encrypt)
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=5
+    environment:
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    labels:
+      # Enable Traefik
+      - traefik.enable=true
+
+      # Dashboard router
+      - traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_DOMAIN}`)
+      - traefik.http.routers.dashboard.entrypoints=websecure
+      - traefik.http.routers.dashboard.service=api@internal
+      - traefik.http.routers.dashboard.tls=true
+
+      - traefik.http.routers.dashboard.tls.certresolver=le
+      - traefik.http.routers.dashboard.middlewares=secure-headers
+
+      # Basic‑auth middleware
+      - traefik.http.middlewares.dashboard-auth.basicauth.users=${BASIC_AUTH_HASH}
+      - traefik.http.routers.dashboard.middlewares=dashboard-auth@docker
+
+      # Middleware ip-allowlist
+      - traefik.http.middlewares.ip-allowlist.ipallowlist.sourceRange=${IP_ALLOWLIST}
+
+      # Middleware secure-headers
+      - traefik.http.middlewares.secure-headers.headers.browserXssFilter=true
+      - traefik.http.middlewares.secure-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.secure-headers.headers.frameDeny=true
+      - traefik.http.middlewares.secure-headers.headers.sslRedirect=true
+      - traefik.http.middlewares.secure-headers.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.secure-headers.headers.stsPreload=true
+      - traefik.http.middlewares.secure-headers.headers.stsSeconds=31536000
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: traefik-cloudflared
+    entrypoint: cloudflared
+    command:
+      - --no-autoupdate
+      - tunnel
+      - run
+      - --token
+      - ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - traefik
+
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: revproxy-dozzle
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dozzle.rule=Host(`dozzle.${DOMAIN_BASE}`)
+      - traefik.http.routers.dozzle.entrypoints=websecure
+      - traefik.http.routers.dozzle.tls.certresolver=le
+      - traefik.http.routers.dozzle.middlewares=secure-headers
+      - traefik.http.services.dozzle.loadbalancer.server.port=8080
+
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: revproxy-portainer
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MOUNT_POINT:-./data}/portainer:/data
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.portainer.rule=Host(`portainer.${DOMAIN_BASE}`)
+      - traefik.http.routers.portainer.entrypoints=websecure
+      - traefik.http.routers.portainer.tls.certresolver=le
+      - traefik.http.routers.portainer.middlewares=secure-headers
+      - traefik.http.services.portainer.loadbalancer.server.port=9000
+
